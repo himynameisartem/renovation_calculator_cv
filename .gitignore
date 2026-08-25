@@ -2,6 +2,7 @@
 __pycache__/
 .ipynb_checkpoints/
 .env
+.idea/
 
 data/raw_photos_sample/
 data/source_photos_v1/
