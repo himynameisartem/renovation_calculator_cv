@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 .ipynb_checkpoints/
+.env
 
 data/raw_photos_sample/
 data/source_photos_v1/
