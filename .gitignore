@@ -9,6 +9,7 @@ datasets/
 models/
 outputs/
 runs/
+scripts/
 
 *.pt
 *.onnx
