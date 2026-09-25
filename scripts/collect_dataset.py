@@ -9,6 +9,8 @@
 """
 
 import argparse
+import json
+import csv
 import hashlib
 import io
 import os
@@ -18,7 +20,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 import requests
-from PIL import Image
+from PIL import Image, ImageOps
 
 PEXELS_SEARCH_URL = "https://api.pexels.com/v1/search"
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
@@ -78,81 +80,118 @@ def search_photos(query: str, api_key: str, per_page: int, page: int) -> list:
     return resp.json().get("photos", [])
 
 
-def download_image(url: str, dest_path: Path) -> bool:
-    try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        img = Image.open(io.BytesIO(r.content))
-        img.verify()
-        img = Image.open(io.BytesIO(r.content)).convert("RGB")
-        img.save(dest_path, format="JPEG", quality=90)
-        return True
-    except Exception as e:
-        print(f"    [x] Filed to download {url}: {e}")
-        return False
+def image_digest(image):
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    header = f"{image.width}x{image.height}:".encode()
+    return hashlib.sha256(header + image.tobytes()).hexdigest()
 
 
-def collect_class(surface: str, class_name: str, queries: list, api_key: str,
-                   target_count: int, out_dir: Path, min_size: int = 400):
+def build_index(out_dir, surfaces):
+    names, digests, ids = set(), set(), set()
+    manifest_path = out_dir / "collection_manifest.jsonl"
+    if manifest_path.exists():
+        for line in manifest_path.read_text().splitlines():
+            record = json.loads(line)
+            if record.get("surface") in surfaces:
+                ids.add(record["photo_id"])
+    duplicates, first = [], {}
+    for surface in surfaces:
+        for path in sorted((out_dir / surface).rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
+                continue
+            names.add(path.name)
+            try:
+                with Image.open(path) as image:
+                    digest = image_digest(image)
+                digests.add(digest)
+                if digest in first:
+                    duplicates.append({"original": str(first[digest]), "duplicate": str(path)})
+                else:
+                    first[digest] = path
+            except (OSError, ValueError):
+                print("Unreadable existing image:", path)
+    report = out_dir / "existing_exact_duplicates.csv"
+    with report.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=["original", "duplicate"])
+        writer.writeheader(); writer.writerows(duplicates)
+    print("Existing duplicate copies:", len(duplicates), "Report:", report)
+    return names, digests, ids
+
+
+def collect_class(surface, class_name, queries, api_key, target_count, out_dir,
+                  index, min_size=400):
     class_dir = out_dir / surface / class_name
     class_dir.mkdir(parents=True, exist_ok=True)
-
-    existing = len(list(class_dir.glob("*.jpg")))
-    if existing >= target_count:
-        print(f"[=] {surface}/{class_name}: already exist {existing}, pass")
-        return
-
-    seen_ids = set()
-    collected = existing
-    print(f"[>] {surface}/{class_name}: target {target_count}, already exist {existing}")
-
+    collected = len(list(class_dir.glob("*.jpg")))
+    names, digests, ids = index
+    print(f"{surface}/{class_name}: existing={collected}, target={target_count}")
+    attempted = set()
     for query in queries:
-        if collected >= target_count:
-            break
         page = 1
         while collected < target_count:
             photos = search_photos(query, api_key, per_page=80, page=page)
             if not photos:
                 break
-            for photo in photos:
+            # Stop if the provider repeats a page.
+            fresh = [photo for photo in photos if photo["id"] not in attempted]
+            if not fresh:
+                break
+            for photo in fresh:
+                photo_id = photo["id"]
+                attempted.add(photo_id)
                 if collected >= target_count:
                     break
-                photo_id = photo["id"]
-                if photo_id in seen_ids:
+                if photo_id in ids or min(photo["width"], photo["height"]) < min_size:
                     continue
-                seen_ids.add(photo_id)
-
-                if photo["width"] < min_size or photo["height"] < min_size:
+                url = photo["src"]["large"]
+                fname = hashlib.md5(url.encode()).hexdigest()[:12] + ".jpg"
+                if fname in names:
+                    ids.add(photo_id)
                     continue
-
-                img_url = photo["src"]["large"]
-                fname = hashlib.md5(img_url.encode()).hexdigest()[:12] + ".jpg"
-                dest = class_dir / fname
-                if dest.exists():
-                    continue
-
-                if download_image(img_url, dest):
+                try:
+                    response = requests.get(url, timeout=30)
+                    response.raise_for_status()
+                    with Image.open(io.BytesIO(response.content)) as source:
+                        image = ImageOps.exif_transpose(source).convert("RGB")
+                    # Compare the exact saved JPEG pixels, matching existing files.
+                    encoded = io.BytesIO()
+                    image.save(encoded, format="JPEG", quality=90)
+                    payload = encoded.getvalue()
+                    with Image.open(io.BytesIO(payload)) as saved:
+                        digest = image_digest(saved)
+                    ids.add(photo_id)
+                    if digest in digests:
+                        continue
+                    destination = class_dir / fname
+                    destination.write_bytes(payload)
+                    names.add(fname); digests.add(digest)
+                    record = dict(surface=surface, label=class_name, photo_id=photo_id,
+                                  query=query, source_url=photo.get("url"), image_url=url,
+                                  path=str(destination.resolve()), pixel_sha256=digest)
+                    with (out_dir / "collection_manifest.jsonl").open("a") as file:
+                        file.write(json.dumps(record, ensure_ascii=False) + "\n")
                     collected += 1
-                    print(f"    [{collected}/{target_count}] {fname}")
-                time.sleep(0.15)
-
+                    print(f"  {collected}/{target_count}: {fname}")
+                except (requests.RequestException, OSError, ValueError) as error:
+                    print("Download failed:", photo_id, type(error).__name__)
+                time.sleep(.15)
             page += 1
-            time.sleep(0.5)
-
-    print(f"[✓] {surface}/{class_name}: total {collected} images\n")
+            time.sleep(.5)
+    print(f"{surface}/{class_name}: total={collected}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Collecting a dataset of surfaces from Pexels API")
-    parser.add_argument("--per-class", type=int, default=80, help="Number of photos per class")
-    parser.add_argument("--out", type=str, default="./data/dataset", help="Folder to save collected dataset")
+    parser.add_argument("--per-class", type=int, default=320, help="Target total photos per class, including existing files")
+    parser.add_argument("--out", type=str, default=str(Path(__file__).resolve().parents[1] / "data/dataset"), help="Folder to save collected dataset")
     parser.add_argument("--api-key", type=str, default=os.environ.get("PEXELS_API_KEY"),
                          help="Pexels API key (PEXELS_API_KEY)")
-    parser.add_argument("--surfaces", type=str, default="walls,floors,ceilings",
+    parser.add_argument("--surfaces", type=str, default="walls",
                          help="how many surfaces to collect (walls, floors, ceilings)")
+    parser.add_argument("--audit-only", action="store_true", help="Report existing exact duplicates without downloading")
     args = parser.parse_args()
 
-    if not args.api_key:
+    if not args.api_key and not args.audit_only:
         print("Error: API key not specified. Pass --api-key or set PEXELS_API_KEY.")
         sys.exit(1)
 
@@ -161,12 +200,20 @@ def main():
 
     surfaces_to_run = [s.strip() for s in args.surfaces.split(",")]
 
+    if any(s not in CLASSES for s in surfaces_to_run):
+        parser.error("Unknown surface")
+    if args.per_class <= 0:
+        parser.error("--per-class must be positive")
+    index = build_index(out_dir, surfaces_to_run)
+    if args.audit_only:
+        return
+
     for surface in surfaces_to_run:
         if surface not in CLASSES:
             print(f"[!] Unknown surface: {surface}, pass")
             continue
         for class_name, queries in CLASSES[surface].items():
-            collect_class(surface, class_name, queries, args.api_key, args.per_class, out_dir)
+            collect_class(surface, class_name, queries, args.api_key, args.per_class, out_dir, index)
 
     print("Done! dataset collected in:", out_dir.resolve())
 
