@@ -41,6 +41,7 @@ networkx==3.6.1
 numpy==2.5.1
 nvidia-ml-py==13.610.43
 opencv-python==5.0.0.93
+pdfplumber==0.11.9
 packaging==26.3
 pandas==3.0.5
 parso==0.8.7
