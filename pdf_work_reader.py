@@ -17,28 +17,44 @@ import pypdfium2 as pdfium
 
 CYRILLIC = re.compile(r"[А-Яа-яЁё]")
 NUMBER = re.compile(r"(?<![\dА-Яа-яA-Za-z])\d+(?:[.,]\d+)?(?!\d)")
-SCHEDULES = (
-    ("ведомость отделки стен", "walls", "м²"),
-    ("ведомость отделки полов", "floor", "м²"),
-    ("ведомость материалов потолков", "ceiling", "м²"),
-    ("ведомость плинтусов", "skirting", "м"),
-    ("спецификация теплых полов", "heating_floor", "м²"),
-    ("спецификация осветительных приборов", "lighting", "шт."),
-    ("спецификация электроточек", "electrical", "шт."),
-)
 NOTE_VERBS = re.compile(
     r"\b(?:демонтаж|монтаж|устройство|укладка|оклейка|окраска|покраска|"
     r"установка|замена|шумоизоляция|гидроизоляция|выполнить)\b",
     re.IGNORECASE,
 )
 ROW_HEADERS = ("обозначение", "наименование", "изображение", "описание", "площадь", "кол-во", "вид ")
-EXPLICIT_QUANTITY = re.compile(r"(?:S\s*=\s*)?(\d+(?:[.,]\d+)?)\s*(м2|м²|м\.п\.|п\.м\.|шт)\s*$", re.IGNORECASE)
-FINISH_LABELS = (
-    "керамогранит", "керамическая плитка", "плитка", "кварцвинил", "ламинат",
-    "паркет", "плинтус", "обои", "окраска стен", "техническая окраска",
-    "натяжной потолок", "покраска потолка", "окраска потолка", "фартук",
-    "декоративные панели", "зеркало", "молдинг",
+EXPLICIT_QUANTITY = re.compile(
+    r"(?:S\s*=\s*)?(\d+(?:[.,]\d+)?)\s*(м2|м²|кв\.?\s*м\.?|м\.п\.|п\.м\.|шт\.?)\s*$",
+    re.IGNORECASE,
 )
+ANY_EXPLICIT_UNIT = re.compile(r"\d+(?:[.,]\d+)?\s*(?:м2|м²|кв\.?\s*м\.?|м\.п\.|п\.м\.|шт\.?)", re.IGNORECASE)
+ROOM_LABELS = re.compile(
+    r"^(?:кухня|спальня|гостиная|санузел|ванная|прихожая|коридор|балкон|лоджия|"
+    r"кабинет|детская|гардеробная|помещение|общая площадь|итого|площадь помещения)\b",
+    re.IGNORECASE,
+)
+
+
+def _schedule_heading(line: str) -> tuple[str, str] | None:
+    match = re.search(r"\b(?:ведомост\w*|спецификац\w*)\b", line)
+    if len(line) > 120 or match is None:
+        return None
+    line = line[match.start():]
+    if "плинтус" in line:
+        return "skirting", "м"
+    if "тепл" in line and "пол" in line:
+        return "heating_floor", "м²"
+    if "освет" in line or "светильник" in line:
+        return "lighting", "шт."
+    if "электр" in line or "розет" in line:
+        return "electrical", "шт."
+    if "потол" in line:
+        return "ceiling", "м²"
+    if "стен" in line:
+        return "walls", "м²"
+    if re.search(r"\bпол(?:а|ов|ы)?\b|напольн", line):
+        return "floor", "м²"
+    return None
 
 
 @dataclass(frozen=True)
@@ -92,9 +108,9 @@ def parse_works(page_texts: list[str]) -> tuple[list[WorkQuantity], list[WorkWit
             if not line:
                 continue
             lower = line.casefold().replace("ё", "е")
-            heading = next((entry for entry in SCHEDULES if entry[0] in lower), None)
+            heading = _schedule_heading(lower)
             if heading:
-                section, unit = heading[1], heading[2]
+                section, unit = heading
                 has_allowance = False
                 pending = ""
                 continue
@@ -149,15 +165,44 @@ def parse_works(page_texts: list[str]) -> tuple[list[WorkQuantity], list[WorkWit
     return list(quantities.values()), list(notes.values())
 
 
-def parse_drawing_legends(path: Path, page_texts: list[str]) -> list[WorkQuantity]:
-    """Read finish quantities printed beside drawing legends, not dimension marks."""
+def _section_for_label(material: str, page_text: str) -> str:
+    label = material.casefold().replace("ё", "е")
+    context = page_text.casefold().replace("ё", "е")
+    if "плинтус" in label:
+        return "skirting"
+    if "теплый пол" in label:
+        return "heating_floor"
+    if any(word in label for word in ("розетка", "выключатель", "электровывод", "терморегулятор", "домофон")):
+        return "electrical"
+    if any(word in label for word in ("светильник", "люстра", "бра настенн")):
+        return "lighting"
+    if any(word in label for word in ("натяжной потолок", "потолок гкл", "окраска потолка")):
+        return "ceiling"
+    if any(word in label for word in ("кварцвинил", "ламинат", "паркет")):
+        return "floor"
+    if any(word in label for word in ("обои", "окраска стен", "покраска стен", "фартук", "панели", "зеркало", "молдинг")):
+        return "walls"
+    if "окраска" in label or "покраска" in label:
+        if "потол" in context and "стен" not in context:
+            return "ceiling"
+        if "стен" in context:
+            return "walls"
+    if any(word in label for word in ("керамогранит", "плитка")):
+        if any(word in context for word in ("развертки стен", "развёртки стен", "отделка стен")):
+            return "walls"
+        if any(word in context for word in ("напольных покрытий", "отделка полов", "план полов")):
+            return "floor"
+    if NOTE_VERBS.search(label):
+        return "other_work"
+    return "unclassified"
+
+
+def parse_drawing_legends(path: Path, page_texts: list[str], scheduled: list[WorkQuantity]) -> list[WorkQuantity]:
+    """Read explicit label + quantity pairs without requiring a named plan or legend."""
+    scheduled_pages = {item.page for item in scheduled}
     candidates = [
         index for index, text in enumerate(page_texts)
-        if ("м2" in text.casefold() or "м²" in text.casefold() or "м.п." in text.casefold())
-        and any(label in text.casefold() for label in FINISH_LABELS)
-        and ("план напольных покрытий" in text.casefold()
-             or "развертки стен" in text.casefold()
-             or "развёртки стен" in text.casefold())
+        if index + 1 not in scheduled_pages and ANY_EXPLICIT_UNIT.search(text)
     ]
     if not candidates:
         return []
@@ -169,22 +214,22 @@ def parse_drawing_legends(path: Path, page_texts: list[str]) -> list[WorkQuantit
             text = document.pages[index].extract_text() or ""
             text = re.sub(r"\(cid:(\d+)\)", lambda match: chr(int(match.group(1))), text)
             text = _repair_shifted_cyrillic(text)
-            lower = text.casefold()
-            section = "floor" if "план напольных покрытий" in lower else "walls"
             for line in text.splitlines():
                 match = EXPLICIT_QUANTITY.search(line.strip())
                 if not match:
                     continue
                 material = line[:match.start()].strip(" ,;:-")
                 material = re.sub(r"^(?:примечание\s*:\s*)", "", material, flags=re.IGNORECASE)
-                if not any(material.casefold().startswith(label) for label in FINISH_LABELS):
+                if (len(material) < 4 or len(material) > 90 or len(CYRILLIC.findall(material)) < 3
+                        or ROOM_LABELS.match(material) or material.casefold().startswith(ROW_HEADERS)):
                     continue
                 quantity = float(match.group(1).replace(",", "."))
                 raw_unit = match.group(2).casefold()
-                unit = "шт." if raw_unit == "шт" else "м" if ".п." in raw_unit else "м²"
+                unit = "шт." if raw_unit.startswith("шт") else "м" if ".п." in raw_unit else "м²"
                 if quantity <= 0:
                     continue
-                item = WorkQuantity(_work_name("skirting" if "плинтус" in material.casefold() else section, material),
+                section = _section_for_label(material, text)
+                item = WorkQuantity(_work_name(section, material) if section != "unclassified" else material,
                                     material, quantity, unit, index + 1, section)
                 found.setdefault((index + 1, material.casefold(), quantity, unit), item)
     return list(found.values())
@@ -195,7 +240,7 @@ def parse_plan_areas(page_texts: list[str]) -> list[WorkQuantity]:
     items = []
     for index, text in enumerate(page_texts):
         lower = text.casefold()
-        if "план теплых полов" not in lower and "план тёплых полов" not in lower:
+        if "теплый пол" not in lower and "тёплый пол" not in lower:
             continue
         areas = [float(value.replace(",", ".")) for value in re.findall(
             r"\bS\s*=\s*(\d+(?:[.,]\d+)?)\s*м[2²]", text, re.IGNORECASE)]
@@ -277,8 +322,9 @@ def _work_name(section: str, material: str) -> str:
 
 
 def render_report(path: Path, quantities: list[WorkQuantity], notes: list[WorkWithoutQuantity], unread: list[int], has_allowance: bool = False) -> str:
-    measured = [item for item in quantities if item.section not in ("lighting", "electrical") and "терморегулятор" not in item.material.casefold()]
-    components = [item for item in quantities if item not in measured]
+    measured = [item for item in quantities if item.section not in ("lighting", "electrical", "unclassified") and "терморегулятор" not in item.material.casefold()]
+    components = [item for item in quantities if item.section in ("lighting", "electrical") or "терморегулятор" in item.material.casefold()]
+    unclassified = [item for item in quantities if item.section == "unclassified"]
     lines = [f"Проект: {path.name}", "", "Работы и объёмы, прямо указанные в проекте:"]
     if measured:
         for item in measured:
@@ -289,6 +335,11 @@ def render_report(path: Path, quantities: list[WorkQuantity], notes: list[WorkWi
     if components:
         lines.extend(["", "Количество изделий и электроточек по спецификациям (не объём монтажа):"])
         for item in components:
+            amount = f"{item.quantity:g}".replace(".", ",")
+            lines.append(f"• {item.material} — {amount} {item.unit} (лист PDF {item.page})")
+    if unclassified:
+        lines.extend(["", "Количественные подписи, которые не удалось отнести к работе:"])
+        for item in unclassified:
             amount = f"{item.quantity:g}".replace(".", ",")
             lines.append(f"• {item.material} — {amount} {item.unit} (лист PDF {item.page})")
     lines.extend(["", "Упомянутые работы без указанного объёма:"])
@@ -318,7 +369,7 @@ def main() -> int:
         parser.error("PDF не найден")
     pages, unread = extract_page_texts(args.pdf)
     quantities, notes = parse_works(pages)
-    quantities.extend(parse_drawing_legends(args.pdf, pages))
+    quantities.extend(parse_drawing_legends(args.pdf, pages, quantities))
     quantities.extend(parse_plan_areas(pages))
     notes.extend(parse_unmeasured_ceiling(pages, quantities))
     report = render_report(args.pdf, quantities, notes, unread, any("+15%" in page for page in pages))
