@@ -9,12 +9,17 @@ data/raw_photos_sample/
 data/source_photos_v1/
 datasets/
 models/
+!models/
+models/*
+!models/ocr/
+!models/ocr/*.onnx
 outputs/
 runs/
 scripts/
 
 *.pt
 *.onnx
+!models/ocr/*.onnx
 *.pth
 *.jpg
 *.jpeg
